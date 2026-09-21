@@ -1,0 +1,16 @@
+# secrets / credentials — never commit
+1.txt
+kaggle.json
+access_token
+*.key
+.env
+
+# local outputs / caches
+*.png
+*.jpg
+__pycache__/
+.ipynb_checkpoints/
+*.log
+comfyui.log
+cloudflared.log
+pinggy.log

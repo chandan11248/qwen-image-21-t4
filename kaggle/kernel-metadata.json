@@ -1,0 +1,15 @@
+{
+  "code_file": "qwen-image-2-1-uncensored-gguf-t4.ipynb",
+  "competition_sources": [],
+  "dataset_sources": [],
+  "enable_gpu": true,
+  "enable_internet": true,
+  "enable_tpu": false,
+  "id": "YOUR_USERNAME/qwen-image-2-1-uncensored-gguf-t4",
+  "is_private": true,
+  "kernel_sources": [],
+  "kernel_type": "notebook",
+  "language": "python",
+  "model_sources": [],
+  "title": "Qwen-Image-2.1-Uncensored-GGUF-T4"
+}
