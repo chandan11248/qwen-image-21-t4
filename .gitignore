@@ -7,6 +7,7 @@ access_token
 
 # local outputs / caches
 *.png
+!assets/demo.png
 *.jpg
 __pycache__/
 .ipynb_checkpoints/

@@ -1,8 +1,16 @@
 # Qwen-Image-2.1 (Uncensored GGUF) on Kaggle T4 — with a ChatGPT-style front end
 
+![MIT](https://img.shields.io/badge/license-MIT-green)
+![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+![Kaggle T4](https://img.shields.io/badge/Kaggle-T4%20GPU-orange)
+![ComfyUI](https://img.shields.io/badge/ComfyUI-GGUF-purple)
+
 We run [`abenzerps/Qwen-Image-2.1-Uncensored-GGUF`](https://huggingface.co/abenzerps/Qwen-Image-2.1-Uncensored-GGUF)
 on a free Kaggle **T4** via **ComfyUI + ComfyUI-GGUF**, and expose it through a tunnel as a dead-simple
 website: **type a prompt → get an image**. No ComfyUI graph-building required for daily use.
+
+![Demo — generated on a free Kaggle T4, 768×768, 20 steps](assets/demo.png)
+*Demo: "majestic lion portrait at golden hour" — generated remotely through the tunnel.*
 
 Everything here was built iteratively and verified end-to-end with the Kaggle CLI
 (push → run → logs): full run, first image, tunnel serving, and remote generation.
