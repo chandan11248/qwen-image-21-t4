@@ -79,8 +79,11 @@ FAST_MODE = True
 
 # Website mode: expose ComfyUI via public cloudflared URL (no signup needed)
 USE_TUNNEL = True
+# Reliable tunnel: free ngrok authtoken (https://dashboard.ngrok.com/get-started/your-authtoken).
+# Paste it here (or leave empty to skip ngrok and use cloudflared+pinggy only).
+NGROK_TOKEN = ""
 # Keep-alive loop minutes (holds the run + tunnel open; 0 = off so batch runs finish)
-KEEP_ALIVE_MINUTES = 480  # 8h persistent tunnel service
+KEEP_ALIVE_MINUTES = 420  # ~7h persistent tunnel (fits remaining quota)
 
 # ---- TURBO benchmark (timed A/B) ----
 # Official-style int8 diffusion now ships IN the uncensored repo (root level).
@@ -90,6 +93,7 @@ FETCH_INT8 = False   # serving pulls int8 via SERVE_DIFFUSION; bench-int8 run fl
 RUN_BENCH = False    # True → timed benchmark run, then finish
 RUN_EVAL = False     # True → full speed+quality evaluation across sizes
 MAKE_ART = False     # True → generate 4 art pieces + GIF + upload (eval runs)
+RUN_SAMPLER = False  # True → sampler/step shootout with PNG uploads for visual judging
 BENCH_MODE = "gguf"  # backend under test: "gguf" or "int8" (one diffusion per run: 20GB cap)
 EVAL_SEED = 777
 BENCH_PROMPT = "cinematic portrait of a warrior queen at sunset, highly detailed, dramatic lighting, 35mm"
@@ -470,6 +474,48 @@ else:
             print("URL reported to status channel.")
         except Exception as e:
             print(f"status-channel post failed (tunnel still works): {e}")
+    # --- Primary tunnel: ngrok (needs free authtoken; most reliable). ---
+    # Set NGROK_TOKEN in config (cell 0). Get one free at https://dashboard.ngrok.com/get-started/your-authtoken
+    if NGROK_TOKEN.strip():
+        subprocess.run("pkill -f 'ngrok http' 2>/dev/null || true", shell=True)
+        time.sleep(1)
+        if shutil.which("ngrok") is None:
+            print("installing ngrok...")
+            r = subprocess.run("wget -q https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz -O /tmp/ngrok.tgz "
+                               "&& tar xzf /tmp/ngrok.tgz -C /usr/local/bin/", shell=True)
+            assert r.returncode == 0, "ngrok download failed"
+        ngrok_log = "/kaggle/working/ngrok.log"
+        _nl = open(ngrok_log, "w")
+        _np = subprocess.Popen(["ngrok", "http", str(MINI_PORT), "--log", "stdout"],
+                               stdout=_nl, stderr=subprocess.STDOUT,
+                               env={**os.environ, "NGROK_AUTHTOKEN": NGROK_TOKEN.strip()})
+        print(f"ngrok PID={_np.pid}, waiting for public URL...")
+        ngrok_url = None
+        for i in range(45):
+            time.sleep(2)
+            try:
+                txt = open(ngrok_log).read()
+            except Exception:
+                continue
+            m = re.search(r"https://[a-zA-Z0-9.-]+\\.ngrok(?:-free)?\\.app", txt)
+            if m:
+                ngrok_url = m.group(0)
+                break
+        if ngrok_url:
+            print("\\n==================================================")
+            print(f"  NGROK URL (use this):  {ngrok_url}")
+            print("==================================================")
+            try:
+                import urllib.request as _urlreq
+                _urlreq.urlopen(_urlreq.Request(
+                    "https://ntfy.sh/YOUR_PRIVATE_NTFY_TOPIC",
+                    data=f"ngrok={ngrok_url}".encode(), method="POST"), timeout=20)
+            except Exception as e:
+                print(f"status-channel post failed (tunnel still works): {e}")
+        else:
+            print("ngrok URL not found — check /kaggle/working/ngrok.log")
+    else:
+        print("NGROK_TOKEN empty, ngrok skipped (set it for the reliable tunnel).")
     # --- Backup tunnel: pinggy (free, no signup; often faster than trycloudflare) ---
     PINGGY_LOG = "/kaggle/working/pinggy.log"
     subprocess.run("pkill -f 'a.pinggy.io' 2>/dev/null || true", shell=True)
@@ -756,6 +802,47 @@ else:
     print(f"FILE_URL_LITTERBOX={_up2.stdout.strip()}", flush=True)
 """
 
+code_sampler = """# ===== 12) SAMPLER shootout: fewer steps via better solvers (timed + upload) =====
+import time as _t
+import numpy as _np
+import subprocess as _sp
+
+_SAMPLER_TESTS = [
+    ("euler-20",   "euler",   20, 501),
+    ("unipc-12",   "uni_pc",  12, 502),
+    ("dpmpp2m-12", "dpmpp_2m", 12, 503),
+    ("dpmpp2m-10", "dpmpp_2m", 10, 504),
+    ("euler-12",   "euler",   12, 505),
+]
+_SP_PROMPT = "cinematic portrait of a warrior queen at sunset, highly detailed, dramatic lighting, 35mm"
+
+def _sstats(img):
+    g = _np.asarray(img.convert("L"), dtype=_np.float32)
+    lap = g[1:-1, 1:-1] * 4 - g[:-2, 1:-1] - g[2:, 1:-1] - g[1:-1, :-2] - g[1:-1, 2:]
+    return float(lap.var())
+
+if not RUN_SAMPLER:
+    print("RUN_SAMPLER=False, sampler shootout skipped.")
+else:
+    for _tag, _smp, _st, _sd in _SAMPLER_TESTS:
+        try:
+            _wf = build_workflow(_SP_PROMPT, DIFFUSION_FILE, TEXT_ENCODER_FILE, VAE_FILE,
+                                 768, 768, _st, 1.0, _smp, "simple", _sd)
+            _t0 = _t.time()
+            _pid, _entry = queue_and_wait(_wf, timeout_s=1800, poll_s=5)
+            _dt = _t.time() - _t0
+            _img, _ = fetch_image(_entry["outputs"])
+            _path = f"/kaggle/working/sampler_{_tag}.png"
+            _img.save(_path)
+            _up = _sp.run(f"curl -s --max-time 120 -F 'reqtype=fileupload' -F 'time=72h' -F 'fileToUpload=@{_path}' https://litterbox.catbox.moe/resources/internals/api.php",
+                          shell=True, capture_output=True, text=True, timeout=150)
+            print(f"SAMPLER[{_tag}] {_dt:.0f}s sharp={_sstats(_img):.0f} -> {_path}", flush=True)
+            print(f"SAMPLER_URL_{_tag}={_up.stdout.strip()}", flush=True)
+        except Exception as _e:
+            print(f"SAMPLER[{_tag}] FAILED: {str(_e)[:300]}", flush=True)
+    print("SAMPLER shootout done.", flush=True)
+"""
+
 cells = [
     nbf.v4.new_markdown_cell(md0),
     nbf.v4.new_code_cell(code1),
@@ -770,6 +857,7 @@ cells = [
     nbf.v4.new_code_cell(code_bench),
     nbf.v4.new_code_cell(code_eval),
     nbf.v4.new_code_cell(code_art),
+    nbf.v4.new_code_cell(code_sampler),
     nbf.v4.new_code_cell(code_keepalive),
 ]
 for i, c in enumerate(cells):
