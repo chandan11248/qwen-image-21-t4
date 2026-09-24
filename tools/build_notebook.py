@@ -88,7 +88,10 @@ INT8_DIFF_REPO = REPO_ID
 INT8_DIFF_FILE = "qwen-image-2.1-UC-int8_convrot.safetensors"  # ~7.3GB, repo root
 FETCH_INT8 = False   # serving pulls int8 via SERVE_DIFFUSION; bench-int8 run flips True
 RUN_BENCH = False    # True → timed benchmark run, then finish
-BENCH_MODE = "gguf"  # "gguf" or "int8" — one diffusion per run (20GB Kaggle disk cap)
+RUN_EVAL = False     # True → full speed+quality evaluation across sizes
+MAKE_ART = False     # True → generate 4 art pieces + GIF + upload (eval runs)
+BENCH_MODE = "gguf"  # backend under test: "gguf" or "int8" (one diffusion per run: 20GB cap)
+EVAL_SEED = 777
 BENCH_PROMPT = "cinematic portrait of a warrior queen at sunset, highly detailed, dramatic lighting, 35mm"
 BENCH_SEED = 123456
 
@@ -139,9 +142,26 @@ def run(cmd):
     assert r.returncode == 0, f"FAILED ({r.returncode}): {cmd}"
     return r
 
-# Kaggle image already ships torch+CUDA — do NOT reinstall torch (slow + breaks CUDA).
-# Only add the small missing deps.
-run(f"{sys.executable} -m pip install -q --upgrade gguf huggingface_hub websocket-client requests")
+# Kaggle image already ships the torch stack + most deps — NEVER reinstall torch here
+# (ComfyUI's requirements.txt would drag multi-GB torch/nvidia wheels and fill the 20GB disk).
+# Install ONLY what is actually missing, with no pip cache.
+import importlib.util as _ilu
+NEED = {"gguf": "gguf", "trampoline": "trampoline", "torchsde": "torchsde",
+        "websocket-client": "websocket", "requests": "requests", "einops": "einops",
+        "safetensors": "safetensors", "aiohttp": "aiohttp", "kornia": "kornia",
+        "spandrel": "spandrel", "soundfile": "soundfile", "av": "av",
+        "pyyaml": "yaml", "tqdm": "tqdm", "pillow": "PIL"}
+_missing = [pkg for pkg, mod in NEED.items() if _ilu.find_spec(mod) is None]
+print("torch stack present:",
+      all(_ilu.find_spec(m) is not None for m in ["torch", "torchvision"]))
+for _m in ["torchvision", "torchaudio"]:
+    if _ilu.find_spec(_m) is None:
+        # --no-deps: take the lib WITHOUT dragging a second torch copy
+        run(f"{sys.executable} -m pip install -q --no-cache-dir --no-deps {_m} || true")
+if _missing:
+    run(f"{sys.executable} -m pip install -q --no-cache-dir {' '.join(_missing)}")
+else:
+    print("all small deps present, pip install skipped.")
 
 if not os.path.isdir(COMFY_DIR):
     run(f"git clone --depth 1 https://github.com/comfyanonymous/ComfyUI {COMFY_DIR}")
@@ -151,11 +171,9 @@ else:
 
 # ComfyUI python deps (full install: Kaggle's torch 2.10+cu128 already satisfies torch pins,
 # and full install pulls transitive deps like `trampoline` required by torchsde)
-run(f"{sys.executable} -m pip install -q -r {COMFY_DIR}/requirements.txt || true")
+run(f"{sys.executable} -m pip install -q --no-cache-dir -r {COMFY_DIR}/requirements.txt || true")
 # Belt-and-braces for the torchsde->trampoline import chain (missing this broke server boot on v1):
-run(f"{sys.executable} -m pip install -q trampoline torchsde || true")
-# Minimal runtime deps ComfyUI actually imports (safe, small):
-run(f"{sys.executable} -m pip install -q pillow pyyaml tqdm einops safetensors aiohttp kornia spandrel soundfile av || true")
+run(f"{sys.executable} -m pip install -q --no-cache-dir trampoline torchsde || true")
 
 GGUF_NODE_DIR = os.path.join(COMFY_DIR, "custom_nodes", "ComfyUI-GGUF")
 if not os.path.isdir(GGUF_NODE_DIR):
@@ -168,50 +186,41 @@ print("\\nComfyUI + ComfyUI-GGUF ready.")
 print(f"ComfyUI: {COMFY_DIR}")
 """
 
-code4 = """# ===== 3) Download weights (resume-safe, ~14.6 GB) =====
+code4 = """# ===== 3) Download weights (all streamed via wget: no 2x HF/XET cache on 20GB disk) =====
 import os
-from huggingface_hub import hf_hub_download
+import urllib.parse as _up
 
-tok = HF_TOKEN.strip() or None
+def _wget(repo, remote, dest, min_gb):
+    url = f"https://huggingface.co/{repo}/resolve/main/{_up.quote(remote)}"
+    print(f"Downloading {remote} ...", flush=True)
+    r = subprocess.run(f"wget -q -c -O {dest} '{url}'", shell=True, capture_output=False)
+    gb = os.path.getsize(dest) / 1024**3 if os.path.exists(dest) else 0
+    assert r.returncode == 0 and gb > min_gb, f"download failed: {remote}"
+    print(f"{gb:5.2f} GB  {dest}", flush=True)
+    return dest
+
 diff_dir = os.path.join(COMFY_DIR, "models", "diffusion_models")
 te_dir   = os.path.join(COMFY_DIR, "models", "text_encoders")
 vae_dir  = os.path.join(COMFY_DIR, "models", "vae")
-unet_dir = os.path.join(COMFY_DIR, "models", "unet")  # legacy path some forks check
-for d in [diff_dir, te_dir, vae_dir, unet_dir]:
+for d in [diff_dir, te_dir, vae_dir]:
     os.makedirs(d, exist_ok=True)
 
-print("Downloading diffusion...")
-print(f"SERVING diffusion={SERVE_DIFFUSION} RUN_BENCH={RUN_BENCH} BENCH_MODE={BENCH_MODE}")
+print(f"SERVING diffusion={SERVE_DIFFUSION} RUN_BENCH={RUN_BENCH} RUN_EVAL={RUN_EVAL} BENCH_MODE={BENCH_MODE}")
 p_diff = None
+# Eval runs test SERVE_DIFFUSION; only bench runs use BENCH_MODE to add a second file.
+# (One diffusion per run — the 20GB disk cap bit us when both flags pulled GGUF+int8.)
 if SERVE_DIFFUSION == "gguf" or (RUN_BENCH and BENCH_MODE == "gguf"):
-    print(f"Downloading diffusion GGUF {DIFFUSION_FILE}...")
-    p_diff = hf_hub_download(repo_id=REPO_ID, filename=DIFFUSION_FILE, local_dir=diff_dir,
-                             token=tok, resume_download=True)
+    p_diff = _wget(REPO_ID, DIFFUSION_FILE, os.path.join(diff_dir, DIFFUSION_FILE), 3.5)
 else:
-    print("Skipping GGUF diffusion (serving int8).")
-print("Downloading text encoder int8 (9.35 GB, slowest part)...")
-p_te = hf_hub_download(repo_id=REPO_ID, filename=f"text_encoders/{TEXT_ENCODER_FILE}", local_dir=os.path.join(COMFY_DIR, "models"),
-                       token=tok, resume_download=True)
-print("Downloading VAE (676 MB)...")
-p_vae = hf_hub_download(repo_id=REPO_ID, filename=f"vae/{VAE_FILE}", local_dir=os.path.join(COMFY_DIR, "models"),
-                        token=tok, resume_download=True)
-
-# NOTE: no legacy models/unet copy — UnetLoaderGGUF reads diffusion_models directly.
-# (A full duplicate copy costs 4.6GB we can't afford next to the int8 file.)
+    print("Skipping GGUF diffusion (serving/eval int8).")
+p_te = _wget(REPO_ID, f"text_encoders/{TEXT_ENCODER_FILE}",
+             os.path.join(te_dir, TEXT_ENCODER_FILE), 8.0)
+p_vae = _wget(REPO_ID, f"vae/{VAE_FILE}", os.path.join(vae_dir, VAE_FILE), 0.5)
 
 if FETCH_INT8 or SERVE_DIFFUSION == "int8":
-    # wget -q (not hf_hub) for the big int8 file: streams straight to disk, no 2x XET chunk cache.
-    import urllib.parse as _up
-    url = f"https://huggingface.co/{INT8_DIFF_REPO}/resolve/main/{_up.quote(INT8_DIFF_FILE)}"
-    dest = os.path.join(diff_dir, INT8_DIFF_FILE)
-    print(f"Downloading UC int8 diffusion (~7.3 GB, turbo path)...")
-    r = subprocess.run(f"wget -q -c -O {dest} '{url}'",
-                       shell=True, capture_output=False)
-    assert r.returncode == 0 and os.path.getsize(dest) > 5 * 1024**3, "int8 download failed"
-    print(f"{os.path.getsize(dest)/1024**3:5.2f} GB  {dest}")
+    _wget(INT8_DIFF_REPO, INT8_DIFF_FILE, os.path.join(diff_dir, INT8_DIFF_FILE), 5.0)
 
-print("--- pip cache purge + disk after downloads ---")
-subprocess.run(f"{sys.executable} -m pip cache purge >/dev/null 2>&1 || true", shell=True)
+print("--- disk after downloads ---")
 print(subprocess.run(["df", "-h", "/kaggle/working"],
       capture_output=True, text=True, timeout=20).stdout)
 
@@ -678,6 +687,75 @@ else:
     print(f"BENCH RESULT [{BENCH_MODE} 768/20]: {t:.0f}s", flush=True)
 """
 
+code_eval = """# ===== 10) EVAL: speed + quality across sizes (timed, with stats) =====
+import time as _t
+import numpy as _np
+
+def _img_stats(img):
+    g = _np.asarray(img.convert("L"), dtype=_np.float32)
+    lap = g[1:-1, 1:-1] * 4 - g[:-2, 1:-1] - g[2:, 1:-1] - g[1:-1, :-2] - g[1:-1, 2:]
+    a = _np.asarray(img, dtype=_np.float32)
+    return float(lap.var()), float(a.mean()), float(a.std())
+
+def _eval_one(tag, prompt, size, steps, seed):
+    wf = build_workflow(prompt, DIFFUSION_FILE, TEXT_ENCODER_FILE, VAE_FILE,
+                        size, size, steps, 1.0, "euler", "simple", seed)
+    t0 = _t.time()
+    pid, entry = queue_and_wait(wf, timeout_s=1800, poll_s=5)
+    dt = _t.time() - t0
+    img, _ = fetch_image(entry["outputs"])
+    path = f"/kaggle/working/eval_{tag}_{pid[:8]}.png"
+    img.save(path)
+    sh, br, co = _img_stats(img)
+    print(f"EVAL[{tag}] {dt:.0f}s sharp={sh:.0f} bright={br:.0f} contrast={co:.0f} size={img.size} -> {path}", flush=True)
+    return path, dt
+
+if not RUN_EVAL:
+    print("RUN_EVAL=False, evaluation skipped.")
+else:
+    _P = "cinematic portrait of a warrior queen at sunset, highly detailed, dramatic lighting, 35mm"
+    _eval_one(f"{SERVE_DIFFUSION}-cold-768-20", _P, 768, 20, EVAL_SEED)
+    _eval_one(f"{SERVE_DIFFUSION}-repeat-same-seed", _P, 768, 20, EVAL_SEED)
+    _eval_one(f"{SERVE_DIFFUSION}-warm-768-20", _P, 768, 20, EVAL_SEED + 1)
+    _eval_one(f"{SERVE_DIFFUSION}-warm-1024-25", _P, 1024, 25, EVAL_SEED + 2)
+    _eval_one(f"{SERVE_DIFFUSION}-warm-512-10", _P, 512, 10, EVAL_SEED + 3)
+    print("EVAL done.", flush=True)
+"""
+
+code_art = """# ===== 11) ART: 4 pieces -> GIF -> upload =====
+import subprocess as _sp
+
+ART_PROMPTS = [
+    ("neon cyberpunk city in rain, flying vehicles, reflections", 11),
+    ("astronaut riding a white horse on mars, cinematic dust", 22),
+    ("underwater crystal palace with whales, god rays, fantasy", 33),
+    ("samurai standing in cherry blossom storm, ukiyo-e style", 44),
+]
+
+if not MAKE_ART:
+    print("MAKE_ART=False, art skipped.")
+else:
+    _frames = []
+    for _pr, _sd in ART_PROMPTS:
+        _wf = build_workflow(_pr, DIFFUSION_FILE, TEXT_ENCODER_FILE, VAE_FILE,
+                             768, 768, 20, 1.0, "euler", "simple", _sd)
+        _pid, _entry = queue_and_wait(_wf, timeout_s=1800, poll_s=5)
+        _img, _ = fetch_image(_entry["outputs"])
+        _p = f"/kaggle/working/art_{_sd}.png"
+        _img.save(_p)
+        _frames.append(_img.resize((512, 512)).convert("RGB"))
+        print(f"ART {_sd} done -> {_p}", flush=True)
+    _gif = "/kaggle/working/qwen_t4_art.gif"
+    _frames[0].save(_gif, save_all=True, append_images=_frames[1:], duration=900, loop=0)
+    print(f"GIF saved {os.path.getsize(_gif)/1024:.0f} KB -> {_gif}", flush=True)
+    _up1 = _sp.run(f"curl -s --max-time 120 -F 'file=@{_gif}' https://0x0.st",
+                   shell=True, capture_output=True, text=True, timeout=150)
+    print(f"FILE_URL_0X0={_up1.stdout.strip()}", flush=True)
+    _up2 = _sp.run(f"curl -s --max-time 120 -F 'reqtype=fileupload' -F 'time=72h' -F 'fileToUpload=@{_gif}' https://litterbox.catbox.moe/resources/internals/api.php",
+                   shell=True, capture_output=True, text=True, timeout=150)
+    print(f"FILE_URL_LITTERBOX={_up2.stdout.strip()}", flush=True)
+"""
+
 cells = [
     nbf.v4.new_markdown_cell(md0),
     nbf.v4.new_code_cell(code1),
@@ -690,6 +768,8 @@ cells = [
     nbf.v4.new_code_cell(code_tunnel),
     nbf.v4.new_code_cell(code7),
     nbf.v4.new_code_cell(code_bench),
+    nbf.v4.new_code_cell(code_eval),
+    nbf.v4.new_code_cell(code_art),
     nbf.v4.new_code_cell(code_keepalive),
 ]
 for i, c in enumerate(cells):

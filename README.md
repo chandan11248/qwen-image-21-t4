@@ -12,6 +12,9 @@ website: **type a prompt → get an image**. No ComfyUI graph-building required 
 ![Demo — generated on a free Kaggle T4, 768×768, 20 steps](assets/demo.png)
 *Demo: "majestic lion portrait at golden hour" — generated remotely through the tunnel.*
 
+![Art sampler GIF — 4 pieces, all T4-generated, 768×768](assets/art.gif)
+*Cyberpunk city, Mars astronaut, underwater palace, ukiyo-e samurai — same model, same GPU.*
+
 Everything here was built iteratively and verified end-to-end with the Kaggle CLI
 (push → run → logs): full run, first image, tunnel serving, and remote generation.
 
@@ -34,30 +37,49 @@ Why this stack: the GGUF quant is what fits a 16GB T4; the int8 text encoder liv
 (encoding runs once per prompt, so speed is unaffected); `cfg=1.0` keeps sampling to one pass per step.
 Q8_0 is deliberately avoided — upstream warns of a `[136] vs [128]` shape mismatch on some setups.
 
-## Measured numbers (Kaggle 2×T4, verified from run logs)
+## Measured numbers (Kaggle 2×T4, timed A/B, same prompt family)
 
-| Task | Time |
-|---|---|
-| Setup (ComfyUI clone, deps, ~17GB weights) | ~3–4 min |
-| ComfyUI boot | ~40–50 s |
-| Cold first image, int8 768²/20 (incl. model load) | ~162 s |
-| Cold first image, GGUF 768²/20 (incl. model load) | ~241 s |
-| **Warm image, either backend, 768²/20** | **~5 s** |
-| 512²/10 through the tunnel (warm) | ~80 s |
-| 1024²/25 cold (GGUF, early build) | ~516 s |
+Speed — sampling time per image (model already loaded):
+
+| Size / steps | GGUF Q4_K_M | Official int8 | Winner |
+|---|---|---|---|
+| 768² / 20 | ~250s | **~115s** | int8, **2.2×** |
+| 1024² / 25 | ~560s | **~280s** | int8, **2.0×** |
+| 512² / 10 | ~70s | **~30s** | int8, **2.3×** |
+
+Cold start (first image incl. weight loading): int8 **~160s** vs GGUF **~250s**.
+Full session overhead: setup ~4 min + server boot ~40s.
+
+Quality — sharpness / brightness / contrast per image (higher sharpness = more detail):
+
+| Image | GGUF sharp | int8 sharp |
+|---|---|---|
+| 768²/20 seed A | 845 | 757 |
+| 768²/20 seed B | 452 | 461 |
+| 1024²/25 | 545 | 563 |
+| 512²/10 | 426 | 395 |
+
+No systematic quality loss from int8: seed-to-seed variance (845 vs 452 on the *same* backend)
+dwarfs backend-to-backend differences. Brightness/contrast are near-identical everywhere.
+
+> Correction note: two early "~5s" readings turned out to be a repeat-identical-prompt
+> cache artifact (bit-identical stats on re-queue), not real sampling speed. The table above
+> uses distinct seeds and is consistent across 14 timed generations.
 
 ### Turbo deep-dive (2026-09-21): what actually makes it fast
 
-Biggest finding: **keep the server warm**. Cold starts pay 3–4 min of one-time weight loading
-(mostly the 8.7GB text encoder); once loaded, a 768²/20 image costs **~5 seconds**.
-The persistent mini-UI service exploits exactly this — images 2..N are seconds, not minutes.
+Biggest finding: **the int8 backend samples ~2.2× faster than GGUF** at every size
+(native int8 kernels beat per-step GGUF dequant on the T4), with no quality loss.
+Second finding: **cold starts dominate** — first image pays 3–4 min of one-time weight
+loading (mostly the 8.7GB text encoder), so a persistent session (like our mini-UI
+service) amortizes that over many images.
 
 Technique shootout for Qwen-Image-2.1 on T4 (sm_75):
 
 | Technique | Verdict | Why |
 |---|---|---|
-| Official int8 diffusion (7.26GB, `UNETLoader`) | ✅ adopted — cold start 162s vs 241s, warm tied ~5s, quality tied | Native int8 kernels, no custom fork, fits 15GB VRAM |
-| GGUF Q4_K_M (4.6GB) | ✅ fallback — smaller download, same warm speed | Kept as `SERVE_DIFFUSION="gguf"` option |
+| Official int8 diffusion (7.26GB, `UNETLoader`) | ✅ adopted — **~2.2× faster sampling** at all sizes, faster cold start, quality tied | Native int8 kernels, no custom fork, fits 15GB VRAM |
+| GGUF Q4_K_M (4.6GB) | ✅ fallback — smaller download, ~2.2× slower sampling | Kept as `SERVE_DIFFUSION="gguf"` option |
 | Lightning/distilled LoRA | ❌ doesn't exist for the 2.1 7B arch (v1 LoRAs incompatible) | Verified via vendor note |
 | TeaCache (`welltop-cn`) | ❌ no Qwen coefficients in source → raises `ValueError` | Read the node source; FLUX coeffs don't transfer (2.1 is single-stream) |
 | SageAttention | ❌ upstream `wontfix` on sm_75; Turing forks slower than xformers | Issues + benchmarks |
