@@ -22,10 +22,11 @@ def node(i, typ, x, y, w, h, inputs, outputs, widgets):
             "widgets_values": widgets}
 
 nodes = [
-    node(1, "UnetLoaderGGUF", 40, 80, 340, 110,
-         [inp("unet_name", "COMBO", widget="unet_name")],
+    node(1, "UNETLoader", 40, 80, 340, 110,
+         [inp("unet_name", "COMBO", widget="unet_name"),
+          inp("weight_dtype", "COMBO", widget="weight_dtype")],
          [out("MODEL", "MODEL", [1], 0)],
-         ["qwen-image-2.1-Q4_K_M.gguf"]),
+         ["qwen-image-2.1-UC-int8_convrot.safetensors", "default"]),
     node(2, "CLIPLoader", 40, 240, 340, 150,
          [inp("clip_name", "COMBO", widget="clip_name"),
           inp("type", "COMBO", widget="type"),

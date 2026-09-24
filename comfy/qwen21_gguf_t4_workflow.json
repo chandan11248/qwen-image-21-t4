@@ -3,7 +3,7 @@
  "nodes": [
   {
    "id": 1,
-   "type": "UnetLoaderGGUF",
+   "type": "UNETLoader",
    "pos": [
     40,
     80
@@ -23,6 +23,14 @@
      "widget": {
       "name": "unet_name"
      }
+    },
+    {
+     "name": "weight_dtype",
+     "type": "COMBO",
+     "link": null,
+     "widget": {
+      "name": "weight_dtype"
+     }
     }
    ],
    "outputs": [
@@ -36,10 +44,11 @@
     }
    ],
    "properties": {
-    "Node name for S&R": "UnetLoaderGGUF"
+    "Node name for S&R": "UNETLoader"
    },
    "widgets_values": [
-    "qwen-image-2.1-Q4_K_M.gguf"
+    "qwen-image-2.1-UC-int8_convrot.safetensors",
+    "default"
    ]
   },
   {

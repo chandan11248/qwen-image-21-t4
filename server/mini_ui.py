@@ -62,9 +62,19 @@ g.onclick = async () => {
 
 
 def build_workflow(prompt, diffusion, encoder, vae, size, steps, seed):
-    """ComfyUI API-format workflow for the GGUF pipeline."""
+    """ComfyUI API-format workflow for the Qwen-Image-2.1 pipeline.
+
+    Loader is picked by file type: .gguf -> UnetLoaderGGUF (ComfyUI-GGUF),
+    .safetensors -> standard UNETLoader.
+    """
+    if diffusion.endswith(".gguf"):
+        loader = {"class_type": "UnetLoaderGGUF",
+                  "inputs": {"unet_name": diffusion}}
+    else:
+        loader = {"class_type": "UNETLoader",
+                  "inputs": {"unet_name": diffusion, "weight_dtype": "default"}}
     return {
-        "1": {"class_type": "UnetLoaderGGUF", "inputs": {"unet_name": diffusion}},
+        "1": loader,
         "2": {"class_type": "CLIPLoader",
               "inputs": {"clip_name": encoder, "type": "qwen_image"}},
         "3": {"class_type": "VAELoader", "inputs": {"vae_name": vae}},
@@ -214,7 +224,7 @@ def main():
     ap = argparse.ArgumentParser(description="Tiny front end for Qwen-Image GGUF on ComfyUI")
     ap.add_argument("--port", type=int, default=8189)
     ap.add_argument("--comfy-url", default="http://127.0.0.1:8188")
-    ap.add_argument("--diffusion", default="qwen-image-2.1-Q4_K_M.gguf")
+    ap.add_argument("--diffusion", default="qwen-image-2.1-UC-int8_convrot.safetensors")
     ap.add_argument("--encoder", default="qwen3vl_8b_int8_convrot.safetensors")
     ap.add_argument("--vae", default="qwen_image_2.1_vae_bf16.safetensors")
     a = ap.parse_args()

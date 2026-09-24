@@ -18,8 +18,8 @@ md0 = """# Qwen-Image-2.1 Uncensored (GGUF) — Kaggle T4 Notebook
 
 Runs **[abenzerps/Qwen-Image-2.1-Uncensored-GGUF](https://huggingface.co/abenzerps/Qwen-Image-2.1-Uncensored-GGUF)** on a Kaggle **T4 (16GB VRAM)** via **ComfyUI + leejet/ComfyUI-GGUF**.
 
-**Model files used (T4-fit, from the model card):**
-- Diffusion (GGUF): `qwen-image-2.1-Q4_K_M.gguf` — 4.60 GB (recommended balance, stays in VRAM)
+**Model files used (T4-fit; turbo-verified 2026-09-21 — warm runs do 768/20 in ~5s):**
+- Diffusion: `qwen-image-2.1-UC-int8_convrot.safetensors` — ~7.3 GB official-style int8 (standard loader, fastest cold start; GGUF `UC-Q4_K_M` fallback available)
 - Text encoder: `text_encoders/qwen3vl_8b_int8_convrot.safetensors` — 9.35 GB (offloaded to CPU RAM, encoding runs once per prompt)
 - VAE: `vae/qwen_image_2.1_vae_bf16.safetensors` — 676 MB
 
@@ -48,10 +48,15 @@ for full-quality 1024×1024, 25 steps.
 code1 = """# ===== 0) Config — EDIT ME =====
 REPO_ID = "abenzerps/Qwen-Image-2.1-Uncensored-GGUF"
 
-# Diffusion GGUF choice (model card: Q4_K_M recommended; Q4_0 smallest/fastest):
-#   "qwen-image-2.1-Q4_K_M.gguf" (4.60GB) | "qwen-image-2.1-Q4_0.gguf" (4.05GB)
-#   "qwen-image-2.1-Q5_K_M.gguf" (5.22GB) | "qwen-image-2.1-Q6_K.gguf" (5.88GB)
-DIFFUSION_FILE = "qwen-image-2.1-Q4_K_M.gguf"
+# Diffusion GGUF choice (upstream renamed files with UC- prefix; Q4_K_M recommended):
+#   "qwen-image-2.1-UC-Q4_K_M.gguf" (4.60GB) | "qwen-image-2.1-UC-Q4_0.gguf" (4.05GB)
+#   "qwen-image-2.1-UC-Q5_K_M.gguf" (5.22GB) | "qwen-image-2.1-UC-Q6_K.gguf" (5.88GB)
+DIFFUSION_FILE = "qwen-image-2.1-UC-Q4_K_M.gguf"
+
+# Serving diffusion: "int8" (official UC-int8, faster cold start, standard loader)
+# or "gguf" (smaller download, more VRAM headroom). Benchmark verdict 2026-09-21:
+# warm sampling tied at ~5s per 768/20 image; cold start int8 162s vs gguf 241s; quality tied.
+SERVE_DIFFUSION = "int8"
 
 TEXT_ENCODER_FILE = "qwen3vl_8b_int8_convrot.safetensors"   # 9.35GB int8 — REQUIRED for T4, runs on CPU RAM
 VAE_FILE = "qwen_image_2.1_vae_bf16.safetensors"            # 676MB
@@ -75,7 +80,17 @@ FAST_MODE = True
 # Website mode: expose ComfyUI via public cloudflared URL (no signup needed)
 USE_TUNNEL = True
 # Keep-alive loop minutes (holds the run + tunnel open; 0 = off so batch runs finish)
-KEEP_ALIVE_MINUTES = 480  # 8h persistent tunnel service (burns ~8h GPU quota)
+KEEP_ALIVE_MINUTES = 480  # 8h persistent tunnel service
+
+# ---- TURBO benchmark (timed A/B) ----
+# Official-style int8 diffusion now ships IN the uncensored repo (root level).
+INT8_DIFF_REPO = REPO_ID
+INT8_DIFF_FILE = "qwen-image-2.1-UC-int8_convrot.safetensors"  # ~7.3GB, repo root
+FETCH_INT8 = False   # serving pulls int8 via SERVE_DIFFUSION; bench-int8 run flips True
+RUN_BENCH = False    # True → timed benchmark run, then finish
+BENCH_MODE = "gguf"  # "gguf" or "int8" — one diffusion per run (20GB Kaggle disk cap)
+BENCH_PROMPT = "cinematic portrait of a warrior queen at sunset, highly detailed, dramatic lighting, 35mm"
+BENCH_SEED = 123456
 
 # Optional: HF token if repo ever goes gated (public now, leave empty)
 HF_TOKEN = ""  # e.g. "hf_..."
@@ -107,6 +122,9 @@ for p in ["/kaggle/working", "/tmp"]:
         print(f"{p}: total={u.total/1024**3:.1f}G used={u.used/1024**3:.1f}G free={u.free/1024**3:.1f}G")
     except Exception as e:
         print(p, e)
+print("--- df -h ---")
+print(subprocess.run(["df", "-h", "/kaggle/working", "/tmp"],
+      capture_output=True, text=True, timeout=20).stdout)
 
 # Fail fast with a clear message if no GPU
 assert torch.cuda.is_available(), "No CUDA GPU detected. In Kaggle: sidebar → Accelerator → GPU T4 x2, then re-run."
@@ -162,9 +180,15 @@ unet_dir = os.path.join(COMFY_DIR, "models", "unet")  # legacy path some forks c
 for d in [diff_dir, te_dir, vae_dir, unet_dir]:
     os.makedirs(d, exist_ok=True)
 
-print("Downloading diffusion GGUF (4-6 GB)...")
-p_diff = hf_hub_download(repo_id=REPO_ID, filename=DIFFUSION_FILE, local_dir=diff_dir,
-                         token=tok, resume_download=True)
+print("Downloading diffusion...")
+print(f"SERVING diffusion={SERVE_DIFFUSION} RUN_BENCH={RUN_BENCH} BENCH_MODE={BENCH_MODE}")
+p_diff = None
+if SERVE_DIFFUSION == "gguf" or (RUN_BENCH and BENCH_MODE == "gguf"):
+    print(f"Downloading diffusion GGUF {DIFFUSION_FILE}...")
+    p_diff = hf_hub_download(repo_id=REPO_ID, filename=DIFFUSION_FILE, local_dir=diff_dir,
+                             token=tok, resume_download=True)
+else:
+    print("Skipping GGUF diffusion (serving int8).")
 print("Downloading text encoder int8 (9.35 GB, slowest part)...")
 p_te = hf_hub_download(repo_id=REPO_ID, filename=f"text_encoders/{TEXT_ENCODER_FILE}", local_dir=os.path.join(COMFY_DIR, "models"),
                        token=tok, resume_download=True)
@@ -172,22 +196,33 @@ print("Downloading VAE (676 MB)...")
 p_vae = hf_hub_download(repo_id=REPO_ID, filename=f"vae/{VAE_FILE}", local_dir=os.path.join(COMFY_DIR, "models"),
                         token=tok, resume_download=True)
 
-# Compat: some GGUF loaders look in models/unet — symlink/copy there (cheap hardlink attempt)
-import shutil
-legacy_gguf = os.path.join(unet_dir, DIFFUSION_FILE)
-if not os.path.exists(legacy_gguf):
-    try:
-        os.link(p_diff, legacy_gguf)
-    except Exception:
-        shutil.copy(p_diff, legacy_gguf)
+# NOTE: no legacy models/unet copy — UnetLoaderGGUF reads diffusion_models directly.
+# (A full duplicate copy costs 4.6GB we can't afford next to the int8 file.)
+
+if FETCH_INT8 or SERVE_DIFFUSION == "int8":
+    # wget -q (not hf_hub) for the big int8 file: streams straight to disk, no 2x XET chunk cache.
+    import urllib.parse as _up
+    url = f"https://huggingface.co/{INT8_DIFF_REPO}/resolve/main/{_up.quote(INT8_DIFF_FILE)}"
+    dest = os.path.join(diff_dir, INT8_DIFF_FILE)
+    print(f"Downloading UC int8 diffusion (~7.3 GB, turbo path)...")
+    r = subprocess.run(f"wget -q -c -O {dest} '{url}'",
+                       shell=True, capture_output=False)
+    assert r.returncode == 0 and os.path.getsize(dest) > 5 * 1024**3, "int8 download failed"
+    print(f"{os.path.getsize(dest)/1024**3:5.2f} GB  {dest}")
+
+print("--- pip cache purge + disk after downloads ---")
+subprocess.run(f"{sys.executable} -m pip cache purge >/dev/null 2>&1 || true", shell=True)
+print(subprocess.run(["df", "-h", "/kaggle/working"],
+      capture_output=True, text=True, timeout=20).stdout)
 
 print("\\n--- files ---")
-for p in [p_diff, p_te, p_vae]:
+for p in [x for x in [p_diff, p_te, p_vae] if x]:
     sz = os.path.getsize(p)/1024**3
     print(f"{sz:5.2f} GB  {p}")
 
 # Sanity: filenames the API workflow will request must exist
-assert os.path.basename(p_diff) == DIFFUSION_FILE
+if p_diff is not None:
+    assert os.path.basename(p_diff) == DIFFUSION_FILE
 assert os.path.exists(os.path.join(te_dir, TEXT_ENCODER_FILE)), f"missing TE: {TEXT_ENCODER_FILE}"
 assert os.path.exists(os.path.join(vae_dir, VAE_FILE)), f"missing VAE: {VAE_FILE}"
 print("\\nAll weights present.")
@@ -253,13 +288,20 @@ import matplotlib.pyplot as plt
 
 BASE_URL = f"http://127.0.0.1:{COMFY_PORT}"
 
-def build_workflow(prompt, diffusion_file, te_file, vae_file, w, h, steps, cfg, sampler, scheduler, seed):
+def build_workflow(prompt, diffusion_file, te_file, vae_file, w, h, steps, cfg, sampler, scheduler, seed, loader_node=None):
     # Flat API workflow — avoids version-fragile subgraph templates.
-    # Node classes: UnetLoaderGGUF (leejet/ComfyUI-GGUF), CLIPLoader(type=qwen_image),
-    #   VAELoader, TextEncodeQwenImage21, EmptyLatentImage, KSampler, VAEDecode, SaveImage
+    # Node classes: UnetLoaderGGUF (leejet/ComfyUI-GGUF) or UNETLoader (safetensors),
+    #   CLIPLoader(type=qwen_image), VAELoader, TextEncodeQwenImage21,
+    #   EmptyLatentImage, KSampler, VAEDecode, SaveImage
+    if loader_node is None:
+        if SERVE_DIFFUSION == "int8":
+            loader_node = {"class_type": "UNETLoader",
+                           "inputs": {"unet_name": INT8_DIFF_FILE, "weight_dtype": "default"}}
+        else:
+            loader_node = {"class_type": "UnetLoaderGGUF",
+                           "inputs": {"unet_name": diffusion_file}}
     return {
-        "1": {"class_type": "UnetLoaderGGUF",
-              "inputs": {"unet_name": diffusion_file}},
+        "1": loader_node,
         "2": {"class_type": "CLIPLoader",
               "inputs": {"clip_name": te_file, "type": "qwen_image"}},
         "3": {"class_type": "VAELoader",
@@ -318,8 +360,12 @@ FW, FH, FSTEPS = (768, 768, 20) if FAST_MODE else (WIDTH, HEIGHT, STEPS)
 print(f"mode={'FAST 768x768/20' if FAST_MODE else 'FULL 1024x1024/25'}")
 
 seed = SEED if isinstance(SEED, int) else random.randint(0, 2**31 - 1)
+_loader = None
+if RUN_BENCH and BENCH_MODE == "int8":
+    _loader = {"class_type": "UNETLoader",
+               "inputs": {"unet_name": INT8_DIFF_FILE, "weight_dtype": "default"}}
 wf = build_workflow(PROMPT, DIFFUSION_FILE, TEXT_ENCODER_FILE, VAE_FILE,
-                    FW, FH, FSTEPS, CFG, SAMPLER, SCHEDULER, seed)
+                    FW, FH, FSTEPS, CFG, SAMPLER, SCHEDULER, seed, _loader)
 print(f"Generating {FW}x{FH} steps={FSTEPS} cfg={CFG} seed={seed} ...")
 print(f"prompt: {PROMPT[:200]}")
 
@@ -578,6 +624,60 @@ _th.Thread(target=_mini_server.serve_forever, daemon=True).start()
 print(f"Mini UI serving on 127.0.0.1:{MINI_PORT} (page is ~4KB, loads even on slow tunnels)")
 """
 
+code_bench = """# ===== 9) TURBO benchmark: GGUF vs official int8, timed A/B =====
+import time as _t
+import numpy as _np
+
+def _sharpness(img):
+    g = _np.asarray(img.convert("L"), dtype=_np.float32)
+    lap = g[1:-1, 1:-1] * 4 - g[:-2, 1:-1] - g[2:, 1:-1] - g[1:-1, :-2] - g[1:-1, 2:]
+    return float(lap.var())
+
+def _bench_wf(loader_node, prompt, size, steps, seed):
+    return {
+        "1": loader_node,
+        "2": {"class_type": "CLIPLoader",
+              "inputs": {"clip_name": TEXT_ENCODER_FILE, "type": "qwen_image"}},
+        "3": {"class_type": "VAELoader",
+              "inputs": {"vae_name": VAE_FILE}},
+        "4": {"class_type": "TextEncodeQwenImage21",
+              "inputs": {"clip": ["2", 0], "prompt": prompt,
+                         "negative_prompt": "", "resolution": size}},
+        "5": {"class_type": "EmptyLatentImage",
+              "inputs": {"width": size, "height": size, "batch_size": 1}},
+        "6": {"class_type": "KSampler",
+              "inputs": {"model": ["1", 0], "positive": ["4", 0], "negative": ["4", 1],
+                         "latent_image": ["5", 0], "seed": seed, "steps": steps, "cfg": 1.0,
+                         "sampler_name": "euler", "scheduler": "simple", "denoise": 1.0}},
+        "7": {"class_type": "VAEDecode",
+              "inputs": {"samples": ["6", 0], "vae": ["3", 0]}},
+        "8": {"class_type": "SaveImage",
+              "inputs": {"images": ["7", 0], "filename_prefix": "bench_turbo"}},
+    }
+
+def _bench_one(name, loader_node, size=768, steps=20):
+    wf = _bench_wf(loader_node, BENCH_PROMPT, size, steps, BENCH_SEED)
+    t0 = _t.time()
+    pid, entry = queue_and_wait(wf, timeout_s=1800, poll_s=5)
+    dt = _t.time() - t0
+    img, _ = fetch_image(entry["outputs"])
+    path = f"/kaggle/working/bench_{name}_{pid[:8]}.png"
+    img.save(path)
+    print(f"BENCH[{name}] {dt:.0f}s  sharp={_sharpness(img):.0f}  size={img.size}  -> {path}", flush=True)
+    return dt
+
+if not RUN_BENCH:
+    print("RUN_BENCH=False, turbo benchmark skipped.")
+else:
+    if BENCH_MODE == "int8":
+        assert os.path.exists(os.path.join(COMFY_DIR, "models", "diffusion_models", INT8_DIFF_FILE)), "int8 file missing"
+        loader = {"class_type": "UNETLoader", "inputs": {"unet_name": INT8_DIFF_FILE, "weight_dtype": "default"}}
+    else:
+        loader = {"class_type": "UnetLoaderGGUF", "inputs": {"unet_name": DIFFUSION_FILE}}
+    t = _bench_one(f"{BENCH_MODE}", loader)
+    print(f"BENCH RESULT [{BENCH_MODE} 768/20]: {t:.0f}s", flush=True)
+"""
+
 cells = [
     nbf.v4.new_markdown_cell(md0),
     nbf.v4.new_code_cell(code1),
@@ -589,6 +689,7 @@ cells = [
     nbf.v4.new_code_cell(code_miniui),
     nbf.v4.new_code_cell(code_tunnel),
     nbf.v4.new_code_cell(code7),
+    nbf.v4.new_code_cell(code_bench),
     nbf.v4.new_code_cell(code_keepalive),
 ]
 for i, c in enumerate(cells):

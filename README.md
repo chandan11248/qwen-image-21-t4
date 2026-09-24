@@ -38,11 +38,32 @@ Q8_0 is deliberately avoided — upstream warns of a `[136] vs [128]` shape mism
 
 | Task | Time |
 |---|---|
-| Setup (ComfyUI clone, deps, ~14.6GB weights) | ~3–4 min |
+| Setup (ComfyUI clone, deps, ~17GB weights) | ~3–4 min |
 | ComfyUI boot | ~40–50 s |
-| 512² / 10 steps (test) | ~80 s |
-| 768² / 20 steps (fast default) | ~4 min |
-| 1024² / 25 steps (best) | ~8–9 min |
+| Cold first image, int8 768²/20 (incl. model load) | ~162 s |
+| Cold first image, GGUF 768²/20 (incl. model load) | ~241 s |
+| **Warm image, either backend, 768²/20** | **~5 s** |
+| 512²/10 through the tunnel (warm) | ~80 s |
+| 1024²/25 cold (GGUF, early build) | ~516 s |
+
+### Turbo deep-dive (2026-09-21): what actually makes it fast
+
+Biggest finding: **keep the server warm**. Cold starts pay 3–4 min of one-time weight loading
+(mostly the 8.7GB text encoder); once loaded, a 768²/20 image costs **~5 seconds**.
+The persistent mini-UI service exploits exactly this — images 2..N are seconds, not minutes.
+
+Technique shootout for Qwen-Image-2.1 on T4 (sm_75):
+
+| Technique | Verdict | Why |
+|---|---|---|
+| Official int8 diffusion (7.26GB, `UNETLoader`) | ✅ adopted — cold start 162s vs 241s, warm tied ~5s, quality tied | Native int8 kernels, no custom fork, fits 15GB VRAM |
+| GGUF Q4_K_M (4.6GB) | ✅ fallback — smaller download, same warm speed | Kept as `SERVE_DIFFUSION="gguf"` option |
+| Lightning/distilled LoRA | ❌ doesn't exist for the 2.1 7B arch (v1 LoRAs incompatible) | Verified via vendor note |
+| TeaCache (`welltop-cn`) | ❌ no Qwen coefficients in source → raises `ValueError` | Read the node source; FLUX coeffs don't transfer (2.1 is single-stream) |
+| SageAttention | ❌ upstream `wontfix` on sm_75; Turing forks slower than xformers | Issues + benchmarks |
+| `torch.compile` | ❌ custom quant ops + multi-min warmup on Kaggle | Wrong tradeoff for short sessions |
+| FP8 weights | ❌ needs sm_89+ (Ada); T4 is sm_75 | Hardware wall |
+| Fewer steps / smaller latents | ✅ already shipped as `FAST_MODE` (768²/20) | ~2× vs 1024²/25 at same quality class |
 
 ## Quickstart — Kaggle (recommended)
 
