@@ -9,7 +9,8 @@ We run [`abenzerps/Qwen-Image-2.1-Uncensored-GGUF`](https://huggingface.co/abenz
 on a free Kaggle **T4** via **ComfyUI + ComfyUI-GGUF**, and expose it through a tunnel as a dead-simple
 website: **type a prompt → get an image**. No ComfyUI graph-building required for daily use.
 
-![Demo — generated on a free Kaggle T4, 768×768, 20 steps](assets/demo.png)
+![Demo — generated on a free Kaggle T4, 5×768, 20 steps](assets/demo.png)
+
 *Demo: "majestic lion portrait at golden hour" — generated remotely through the tunnel.*
 
 ![Art sampler GIF — 4 pieces, all T4-generated, 768×768](assets/art.gif)
