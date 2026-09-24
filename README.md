@@ -13,6 +13,8 @@ website: **type a prompt → get an image**. No ComfyUI graph-building required 
 *Demo: "majestic lion portrait at golden hour" — generated remotely through the tunnel.*
 
 ![Art sampler GIF — 4 pieces, all T4-generated, 768×768](assets/art.gif)
+
+
 *Cyberpunk city, Mars astronaut, underwater palace, ukiyo-e samurai — same model, same GPU.*
 
 Everything here was built iteratively and verified end-to-end with the Kaggle CLI
